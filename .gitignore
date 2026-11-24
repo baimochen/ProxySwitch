@@ -1,0 +1,4 @@
+ProxySwitch.app/
+.DS_Store
+*.o
+*.dSYM
