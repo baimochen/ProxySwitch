@@ -7,8 +7,8 @@ final class Config {
     static let shared = Config()
     private let d = UserDefaults.standard
 
-    var hotspotSSID: String { get { d.string(forKey: "hotspotSSID") ?? "11223344" } set { d.set(newValue, forKey: "hotspotSSID") } }
-    var proxyHost: String { get { d.string(forKey: "proxyHost") ?? "10.23.216.132" } set { d.set(newValue, forKey: "proxyHost") } }
+    var hotspotSSID: String { get { d.string(forKey: "hotspotSSID") ?? "" } set { d.set(newValue, forKey: "hotspotSSID") } }
+    var proxyHost: String { get { d.string(forKey: "proxyHost") ?? "" } set { d.set(newValue, forKey: "proxyHost") } }
     var proxyPort: String { get { d.string(forKey: "proxyPort") ?? "7890" } set { d.set(newValue, forKey: "proxyPort") } }
     var serviceName: String { get { d.string(forKey: "serviceName") ?? "Wi-Fi" } set { d.set(newValue, forKey: "serviceName") } }
     var iconName: String { get { d.string(forKey: "iconName") ?? "key.fill" } set { d.set(newValue, forKey: "iconName") } }
@@ -17,8 +17,27 @@ final class Config {
     var syncPAC: Bool { get { d.object(forKey: "syncPAC") as? Bool ?? true } set { d.set(newValue, forKey: "syncPAC") } }
     var alsoSOCKS: Bool { get { d.object(forKey: "alsoSOCKS") as? Bool ?? false } set { d.set(newValue, forKey: "alsoSOCKS") } }
     var socksPort: String { get { d.string(forKey: "socksPort") ?? "7891" } set { d.set(newValue, forKey: "socksPort") } }
-    var hotspotPrefix: String { get { d.string(forKey: "hotspotPrefix") ?? "10.23.216." } set { d.set(newValue, forKey: "hotspotPrefix") } }
+    var hotspotPrefix: String { get { d.string(forKey: "hotspotPrefix") ?? "" } set { d.set(newValue, forKey: "hotspotPrefix") } }
     var autoMode: Bool { get { d.object(forKey: "autoMode") as? Bool ?? true } set { d.set(newValue, forKey: "autoMode") } }
+
+    var isConfigured: Bool {
+        !proxyHost.trimmingCharacters(in: .whitespaces).isEmpty &&
+        !hotspotPrefix.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
+    static func isValidPort(_ raw: String) -> Bool {
+        guard let port = Int(raw), (1...65535).contains(port) else { return false }
+        return true
+    }
+}
+
+// MARK: - 网络状态快照
+
+private struct NetworkSnapshot {
+    var ip: String = "检测中…"
+    var proxyEnabled: Bool = false
+    var savedNetworks: [String] = []
+    var interfaceName: String = "en0"
 }
 
 // MARK: - 设置窗口
@@ -48,7 +67,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     init(onSave: @escaping () -> Void) {
         self.onSave = onSave
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 560),
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 560),
                          styleMask: [.titled, .closable], backing: .buffered, defer: false)
         w.title = "ProxySwitch 设置"
         w.center()
@@ -65,7 +84,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let label = NSTextField(labelWithString: title)
         label.alignment = .right
         label.setContentHuggingPriority(.defaultHigh, for: .horizontal)
-        label.widthAnchor.constraint(equalToConstant: 140).isActive = true
+        label.widthAnchor.constraint(equalToConstant: 150).isActive = true
         let h = NSStackView(views: [label, control])
         h.orientation = .horizontal
         h.spacing = 10
@@ -82,14 +101,22 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     private func buildUI() {
         ssidField = NSTextField(string: "")
+        ssidField.placeholderString = "可选，仅用于菜单展示"
         hostField = NSTextField(string: "")
+        hostField.placeholderString = "例：172.20.10.1"
         portField = NSTextField(string: "")
+        portField.placeholderString = "1–65535（默认 7890）"
         serviceField = NSTextField(string: "")
+        serviceField.placeholderString = "默认 Wi-Fi"
         waitField = NSTextField(string: "")
+        waitField.placeholderString = "3–60"
         prefixField = NSTextField(string: "")
+        prefixField.placeholderString = "例：172.20.10."
         socksPortField = NSTextField(string: "")
+        socksPortField.placeholderString = "1–65535（默认 7891）"
+
         for f in [ssidField, hostField, portField, serviceField, waitField, prefixField, socksPortField] {
-            f!.widthAnchor.constraint(equalToConstant: 200).isActive = true
+            f!.widthAnchor.constraint(equalToConstant: 210).isActive = true
         }
 
         iconPopup = NSPopUpButton(frame: .zero, pullsDown: false)
@@ -113,14 +140,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         buttons.spacing = 10
 
         let stack = NSStackView(views: [
-            row("热点 / Wi-Fi 名称", ssidField),
+            row("热点名称（展示用）", ssidField),
             row("代理服务器", hostField),
-            row("代理端口", portField),
+            row("HTTP/HTTPS 端口", portField),
             row("热点网段前缀", prefixField),
-            hint("  用本机 IP 前缀判断是否已连上热点（例：10.23.216.）"),
+            hint("  用本机 IP 前缀判断是否已连上热点（例：172.20.10.）"),
             row("网络服务名", serviceField),
-            hint("  系统设置 → 网络 里那个服务的名字，一般是 Wi-Fi"),
-            row("等待连接秒数", waitField),
+            hint("  系统设置 → 网络 里对应服务的名称，一般是 Wi-Fi"),
+            row("切网后等待秒数", waitField),
             row("菜单栏图标", iconPopup),
             row("SOCKS 端口", socksPortField),
             autoModeCheck,
@@ -145,7 +172,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         window?.contentView = content
 
         let fit = stack.fittingSize
-        window?.setContentSize(NSSize(width: max(500, fit.width + 42), height: max(300, fit.height + 42)))
+        window?.setContentSize(NSSize(width: max(520, fit.width + 42), height: max(300, fit.height + 42)))
     }
 
     private func loadValues() {
@@ -176,25 +203,49 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    private func showValidationError(_ message: String) {
+        let alert = NSAlert()
+        alert.messageText = "设置无效"
+        alert.informativeText = message
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "好")
+        if let win = window {
+            alert.beginSheetModal(for: win)
+        } else {
+            alert.runModal()
+        }
+    }
+
     @objc private func saveClicked() {
-        let ssid = ssidField.stringValue.trimmingCharacters(in: .whitespaces)
-        if !ssid.isEmpty { config.hotspotSSID = ssid }
-        let host = hostField.stringValue.trimmingCharacters(in: .whitespaces)
-        if !host.isEmpty { config.proxyHost = host }
         let port = portField.stringValue.trimmingCharacters(in: .whitespaces)
-        if !port.isEmpty { config.proxyPort = port }
-        let service = serviceField.stringValue.trimmingCharacters(in: .whitespaces)
-        if !service.isEmpty { config.serviceName = service }
-        let prefix = prefixField.stringValue.trimmingCharacters(in: .whitespaces)
-        if !prefix.isEmpty { config.hotspotPrefix = prefix }
-        config.waitSeconds = max(3, Int(waitField.stringValue) ?? 9)
+        if !Config.isValidPort(port) {
+            showValidationError("HTTP/HTTPS 端口必须是 1–65535 之间的整数。")
+            return
+        }
         let socksPort = socksPortField.stringValue.trimmingCharacters(in: .whitespaces)
-        if !socksPort.isEmpty { config.socksPort = socksPort }
-        if let sym = iconPopup.selectedItem?.representedObject as? String { config.iconName = sym }
+        if socksCheck.state == .on && !Config.isValidPort(socksPort) {
+            showValidationError("SOCKS 端口必须是 1–65535 之间的整数。")
+            return
+        }
+
+        let service = serviceField.stringValue.trimmingCharacters(in: .whitespaces)
+        config.hotspotSSID = ssidField.stringValue.trimmingCharacters(in: .whitespaces)
+        config.proxyHost = hostField.stringValue.trimmingCharacters(in: .whitespaces)
+        config.proxyPort = port
+        config.serviceName = service.isEmpty ? "Wi-Fi" : service
+        config.hotspotPrefix = prefixField.stringValue.trimmingCharacters(in: .whitespaces)
+        config.waitSeconds = min(60, max(3, Int(waitField.stringValue.trimmingCharacters(in: .whitespaces)) ?? 9))
+        if Config.isValidPort(socksPort) {
+            config.socksPort = socksPort
+        }
+        if let sym = iconPopup.selectedItem?.representedObject as? String {
+            config.iconName = sym
+        }
         config.autoMode = autoModeCheck.state == .on
         config.autoReleaseOnSwitch = autoReleaseCheck.state == .on
         config.syncPAC = syncPACCheck.state == .on
         config.alsoSOCKS = socksCheck.state == .on
+
         onSave()
         window?.close()
     }
@@ -217,12 +268,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let ns = "/usr/sbin/networksetup"
     private let ipconfig = "/usr/sbin/ipconfig"
     private var settingsController: SettingsWindowController?
+
+    // 所有可变网络状态仅在 queue 上读写；snapshot 通过主线程更新菜单
     private let queue = DispatchQueue(label: "com.dsh.proxyswitch.monitor")
     private var autoOpened = false
     private var suppressAuto = false
     private var lastIP = ""
+    private var snapshot = NetworkSnapshot()
+    private var monitoredInterface = ""
+
     private var store: SCDynamicStore?
+    private var storeSource: CFRunLoopSource?
     private var checkWorkItem: DispatchWorkItem?
+    private var isMenuOpen = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -230,18 +288,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         statusItem.menu = menu
         buildMenu()
-        setupNetworkMonitor()
-        scheduleCheck(0.5)
+
         queue.async {
-            let ip = self.currentIP()
-            if !ip.hasPrefix(self.config.hotspotPrefix) && self.currentProxyServer() == self.config.proxyHost {
-                self.proxyOff()
-                DispatchQueue.main.async { self.buildMenu() }
+            let iface = self.resolveInterface(for: self.config.serviceName)
+            let snap = self.collectSnapshot(interface: iface)
+            if self.config.isConfigured,
+               !snap.ip.hasPrefix(self.config.hotspotPrefix),
+               self.currentProxyServer() == self.config.proxyHost {
+                _ = self.proxyOff()
+            }
+            let updatedSnap = self.collectSnapshot(interface: iface)
+            DispatchQueue.main.async {
+                self.snapshot = updatedSnap
+                self.setupNetworkMonitor(interface: iface)
+                self.buildMenu()
+                self.scheduleCheck(0.4)
             }
         }
     }
 
-    func menuWillOpen(_ menu: NSMenu) { buildMenu() }
+    func menuWillOpen(_ menu: NSMenu) {
+        isMenuOpen = true
+        buildMenu()
+        refreshSnapshotAsync()
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        isMenuOpen = false
+    }
 
     private func applyIcon() {
         let img = NSImage(systemSymbolName: config.iconName, accessibilityDescription: "ProxySwitch")
@@ -249,20 +323,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem?.button?.image = img
     }
 
-    private func run(_ tool: String, _ args: [String]) -> String {
+    // MARK: 系统命令执行（带超时保护）
+
+    private func run(_ tool: String, _ args: [String], timeout: TimeInterval = 5.0) -> (status: Int32, output: String) {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: tool)
         p.arguments = args
         let pipe = Pipe()
         p.standardOutput = pipe
         p.standardError = pipe
-        do { try p.run() } catch { return "" }
-        p.waitUntilExit()
-        return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+
+        let done = DispatchSemaphore(value: 0)
+        p.terminationHandler = { _ in done.signal() }
+
+        do {
+            try p.run()
+        } catch {
+            return (-1, "")
+        }
+
+        if done.wait(timeout: .now() + timeout) == .timedOut {
+            p.terminate()
+            _ = done.wait(timeout: .now() + 0.5)
+            return (-2, "Command timed out")
+        }
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        return (p.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+    }
+
+    private func resolveInterface(for serviceName: String) -> String {
+        let res = run(ns, ["-listallhardwareports"])
+        guard res.status == 0 else { return "en0" }
+
+        let lines = res.output.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        var matchedPort = false
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("Hardware Port:") {
+                let portName = trimmed.replacingOccurrences(of: "Hardware Port:", with: "").trimmingCharacters(in: .whitespaces)
+                matchedPort = (portName == serviceName)
+            } else if matchedPort && trimmed.hasPrefix("Device:") {
+                let dev = trimmed.replacingOccurrences(of: "Device:", with: "").trimmingCharacters(in: .whitespaces)
+                if !dev.isEmpty { return dev }
+                matchedPort = false
+            }
+        }
+        return "en0"
     }
 
     private func currentProxyServer() -> String {
-        for line in run(ns, ["-getwebproxy", config.serviceName]).split(separator: "\n") {
+        let res = run(ns, ["-getwebproxy", config.serviceName])
+        for line in res.output.split(separator: "\n") {
             if line.hasPrefix("Server:") {
                 return line.replacingOccurrences(of: "Server:", with: "").trimmingCharacters(in: .whitespaces)
             }
@@ -271,44 +383,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func proxyEnabled() -> Bool {
-        run(ns, ["-getwebproxy", config.serviceName]).contains("Enabled: Yes")
+        run(ns, ["-getwebproxy", config.serviceName]).output.contains("Enabled: Yes")
     }
 
-    private func currentIP() -> String {
-        let out = run(ipconfig, ["getifaddr", "en0"]).trimmingCharacters(in: .whitespacesAndNewlines)
-        return out.isEmpty ? "未连接" : out
+    private func currentIP(interface: String) -> String {
+        let res = run(ipconfig, ["getifaddr", interface])
+        let out = res.output.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (res.status == 0 && !out.isEmpty) ? out : "未连接"
     }
 
-    private func onHotspot() -> Bool {
-        currentIP().hasPrefix(config.hotspotPrefix)
-    }
-
-    private func savedNetworks() -> [String] {
-        run(ns, ["-listpreferredwirelessnetworks", "en0"])
+    private func savedNetworks(interface: String) -> [String] {
+        run(ns, ["-listpreferredwirelessnetworks", interface]).output
             .split(separator: "\n").dropFirst()
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
     }
 
-    private func proxyOn() {
-        if config.syncPAC { _ = run(ns, ["-setautoproxystate", config.serviceName, "off"]) }
-        _ = run(ns, ["-setwebproxy", config.serviceName, config.proxyHost, config.proxyPort])
-        _ = run(ns, ["-setsecurewebproxy", config.serviceName, config.proxyHost, config.proxyPort])
-        if config.alsoSOCKS {
-            _ = run(ns, ["-setsocksfirewallproxy", config.serviceName, config.proxyHost, config.socksPort])
-        }
+    private func collectSnapshot(interface: String) -> NetworkSnapshot {
+        NetworkSnapshot(
+            ip: currentIP(interface: interface),
+            proxyEnabled: proxyEnabled(),
+            savedNetworks: savedNetworks(interface: interface),
+            interfaceName: interface
+        )
     }
 
-    private func proxyOff() {
-        _ = run(ns, ["-setwebproxystate", config.serviceName, "off"])
-        _ = run(ns, ["-setsecurewebproxystate", config.serviceName, "off"])
+    @discardableResult
+    private func proxyOn() -> Bool {
+        guard !config.proxyHost.trimmingCharacters(in: .whitespaces).isEmpty,
+              Config.isValidPort(config.proxyPort) else { return false }
+        if config.syncPAC {
+            _ = run(ns, ["-setautoproxystate", config.serviceName, "off"])
+        }
+        let r1 = run(ns, ["-setwebproxy", config.serviceName, config.proxyHost, config.proxyPort])
+        let r2 = run(ns, ["-setsecurewebproxy", config.serviceName, config.proxyHost, config.proxyPort])
+        if config.alsoSOCKS && Config.isValidPort(config.socksPort) {
+            _ = run(ns, ["-setsocksfirewallproxy", config.serviceName, config.proxyHost, config.socksPort])
+        }
+        return r1.status == 0 && r2.status == 0
+    }
+
+    @discardableResult
+    private func proxyOff() -> Bool {
+        let r1 = run(ns, ["-setwebproxystate", config.serviceName, "off"])
+        let r2 = run(ns, ["-setsecurewebproxystate", config.serviceName, "off"])
         _ = run(ns, ["-setsocksfirewallproxystate", config.serviceName, "off"])
+        return r1.status == 0 && r2.status == 0
     }
 
     // MARK: 自动监控
 
-    // 注册系统网络配置变化通知（事件驱动，不轮询）
-    private func setupNetworkMonitor() {
+    private func setupNetworkMonitor(interface: String) {
+        if monitoredInterface == interface && store != nil { return }
+        if let src = storeSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), src, .commonModes)
+            storeSource = nil
+        }
+        store = nil
+        monitoredInterface = interface
+
         var context = SCDynamicStoreContext(version: 0,
                                             info: Unmanaged.passUnretained(self).toOpaque(),
                                             retain: nil, release: nil, copyDescription: nil)
@@ -317,16 +450,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let me = Unmanaged<AppDelegate>.fromOpaque(info).takeUnretainedValue()
             me.scheduleCheck()
         }
-        guard let store = SCDynamicStoreCreate(nil, "com.dsh.proxyswitch" as CFString, callback, &context) else { return }
-        let keys = ["State:/Network/Global/IPv4", "State:/Network/Interface/en0/IPv4"] as CFArray
-        SCDynamicStoreSetNotificationKeys(store, keys, nil)
-        if let source = SCDynamicStoreCreateRunLoopSource(nil, store, 0) {
+        guard let newStore = SCDynamicStoreCreate(nil, "com.dsh.proxyswitch" as CFString, callback, &context) else { return }
+        let keys = ["State:/Network/Global/IPv4", "State:/Network/Interface/\(interface)/IPv4"] as CFArray
+        SCDynamicStoreSetNotificationKeys(newStore, keys, nil)
+        if let source = SCDynamicStoreCreateRunLoopSource(nil, newStore, 0) {
             CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+            storeSource = source
         }
-        self.store = store
+        store = newStore
     }
 
-    // 合并短时间内的多次变化（Wi-Fi 连接时 IP 会变好几次）
     private func scheduleCheck(_ delay: TimeInterval = 0.6) {
         checkWorkItem?.cancel()
         let item = DispatchWorkItem { [weak self] in self?.checkNetwork() }
@@ -334,36 +467,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
     }
 
+    private func refreshSnapshotAsync() {
+        queue.async {
+            let iface = self.resolveInterface(for: self.config.serviceName)
+            let snap = self.collectSnapshot(interface: iface)
+            DispatchQueue.main.async {
+                self.snapshot = snap
+                self.setupNetworkMonitor(interface: iface)
+                if self.isMenuOpen {
+                    self.buildMenu()
+                }
+            }
+        }
+    }
+
     private func checkNetwork() {
         queue.async {
-            let ip = self.currentIP()
-            let match = ip.hasPrefix(self.config.hotspotPrefix)
-            let on = self.proxyEnabled()
+            let iface = self.resolveInterface(for: self.config.serviceName)
+            let ip = self.currentIP(interface: iface)
+            let match = self.config.isConfigured && ip.hasPrefix(self.config.hotspotPrefix)
+            var on = self.proxyEnabled()
             let ipChanged = (ip != self.lastIP)
             if ipChanged {
                 self.lastIP = ip
                 self.suppressAuto = false
             }
-            var changed = ipChanged
 
-            if self.config.autoMode && !self.suppressAuto {
+            if self.config.autoMode && self.config.isConfigured && !self.suppressAuto {
                 if match {
                     if !on {
-                        self.proxyOn()
-                        changed = true
+                        if self.proxyOn() {
+                            on = true
+                        }
                     }
                     self.autoOpened = true
                 } else if on && self.autoOpened {
-                    self.proxyOff()
+                    _ = self.proxyOff()
+                    on = false
                     self.autoOpened = false
-                    changed = true
                 } else if !on {
                     self.autoOpened = false
                 }
             }
 
-            if changed {
-                DispatchQueue.main.async { self.buildMenu() }
+            let snap = NetworkSnapshot(
+                ip: ip,
+                proxyEnabled: on,
+                savedNetworks: self.savedNetworks(interface: iface),
+                interfaceName: iface
+            )
+            DispatchQueue.main.async {
+                self.snapshot = snap
+                self.setupNetworkMonitor(interface: iface)
+                self.buildMenu()
             }
         }
     }
@@ -371,18 +527,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func buildMenu() {
         menu.removeAllItems()
 
-        let ip = currentIP()
-        let onProxy = proxyEnabled()
-        let match = ip.hasPrefix(config.hotspotPrefix)
+        let ip = snapshot.ip
+        let onProxy = snapshot.proxyEnabled
+        let match = config.isConfigured && ip.hasPrefix(config.hotspotPrefix)
 
-        let status = NSMenuItem(title: "代理：\(onProxy ? "开" : "关")    IP：\(ip)   \(match ? "✓ 热点" : "非热点")",
-                                action: nil, keyEquivalent: "")
+        let statusTitle: String
+        if !config.isConfigured {
+            statusTitle = "尚未配置代理与网段前缀（请点下方「设置…」）"
+        } else {
+            statusTitle = "代理：\(onProxy ? "开" : "关")    IP（\(snapshot.interfaceName)）：\(ip)   \(match ? "✓ 热点" : "非热点")"
+        }
+        let status = NSMenuItem(title: statusTitle, action: nil, keyEquivalent: "")
         status.isEnabled = false
         menu.addItem(status)
 
-        let summary = NSMenuItem(title: "\(config.proxyHost):\(config.proxyPort) → \(config.hotspotSSID)", action: nil, keyEquivalent: "")
-        summary.isEnabled = false
-        menu.addItem(summary)
+        if config.isConfigured {
+            let targetLabel = config.hotspotSSID.isEmpty ? "\(config.hotspotPrefix)*" : config.hotspotSSID
+            let summary = NSMenuItem(title: "\(config.proxyHost):\(config.proxyPort) → \(targetLabel)", action: nil, keyEquivalent: "")
+            summary.isEnabled = false
+            menu.addItem(summary)
+        }
         menu.addItem(.separator())
 
         let auto = NSMenuItem(title: "自动检测：\(config.autoMode ? "开" : "关")", action: #selector(toggleAuto), keyEquivalent: "")
@@ -392,6 +556,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let onItem = NSMenuItem(title: "手动开代理", action: #selector(manualProxyOn), keyEquivalent: "")
         onItem.target = self
+        onItem.isEnabled = !config.proxyHost.trimmingCharacters(in: .whitespaces).isEmpty
         menu.addItem(onItem)
 
         let offItem = NSMenuItem(title: "手动关代理", action: #selector(manualProxyOff), keyEquivalent: "")
@@ -402,7 +567,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let wifiItem = NSMenuItem(title: "切换 Wi-Fi", action: nil, keyEquivalent: "")
         let wifiMenu = NSMenu()
-        for name in savedNetworks() {
+        for name in snapshot.savedNetworks {
             let item = NSMenuItem(title: name, action: #selector(joinNetwork(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = name
@@ -435,31 +600,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func toggleAuto() {
         config.autoMode.toggle()
-        autoOpened = false
-        suppressAuto = false
-        buildMenu()
-        settingsController?.refreshFromConfig()
-        scheduleCheck(0.2)
-    }
-
-    @objc private func manualProxyOn() {
         queue.async {
-            self.proxyOn()
             self.autoOpened = false
             self.suppressAuto = false
             DispatchQueue.main.async {
                 self.buildMenu()
                 self.settingsController?.refreshFromConfig()
+                self.scheduleCheck(0.2)
+            }
+        }
+    }
+
+    @objc private func manualProxyOn() {
+        queue.async {
+            let ok = self.proxyOn()
+            self.autoOpened = false
+            self.suppressAuto = false
+            let snap = self.collectSnapshot(interface: self.resolveInterface(for: self.config.serviceName))
+            DispatchQueue.main.async {
+                self.snapshot = snap
+                self.buildMenu()
+                self.settingsController?.refreshFromConfig()
+                if !ok {
+                    self.showAlert("开启代理失败", "请检查「设置…」中的代理服务器和端口是否正确。")
+                }
             }
         }
     }
 
     @objc private func manualProxyOff() {
         queue.async {
-            self.proxyOff()
+            _ = self.proxyOff()
             self.autoOpened = false
             self.suppressAuto = true
+            let snap = self.collectSnapshot(interface: self.resolveInterface(for: self.config.serviceName))
             DispatchQueue.main.async {
+                self.snapshot = snap
                 self.buildMenu()
                 self.settingsController?.refreshFromConfig()
             }
@@ -468,15 +644,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func joinNetwork(_ sender: NSMenuItem) {
         guard let ssid = sender.representedObject as? String else { return }
+        let waitSec = config.waitSeconds
         queue.async {
-            if self.config.autoReleaseOnSwitch { self.proxyOff() }
-            let out = self.run(self.ns, ["-setairportnetwork", "en0", ssid])
-            sleep(UInt32(self.config.waitSeconds))
-            let failed = out.contains("Failed") || out.lowercased().contains("error")
+            let iface = self.resolveInterface(for: self.config.serviceName)
+            if self.config.autoReleaseOnSwitch { _ = self.proxyOff() }
+            let res = self.run(self.ns, ["-setairportnetwork", iface, ssid], timeout: 10.0)
+            let failed = res.status != 0 || res.output.contains("Failed") || res.output.lowercased().contains("error")
+            let snap = self.collectSnapshot(interface: iface)
             DispatchQueue.main.async {
+                self.snapshot = snap
                 self.buildMenu()
                 if failed {
                     self.showAlert("自动切换失败", "系统不允许脚本直接切换 Wi-Fi。\n请点菜单栏的 Wi-Fi 图标手动选择「\(ssid)」，连上后会自动开代理。")
+                } else {
+                    // 非阻塞等待切网后复检，避免阻塞后台队列
+                    self.scheduleCheck(TimeInterval(waitSec))
                 }
             }
         }
