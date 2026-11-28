@@ -1,5 +1,14 @@
 import Cocoa
+import Darwin
 import SystemConfiguration
+
+// MARK: - 自动策略（互斥）
+
+enum AutoStrategy: Int {
+    case none = 0
+    case phoneProxy = 1
+    case localClash = 2
+}
 
 // MARK: - 配置
 
@@ -7,22 +16,90 @@ final class Config {
     static let shared = Config()
     private let d = UserDefaults.standard
 
+    // MARK: 手机代理（热点转发到手机 Clash）
     var hotspotSSID: String { get { d.string(forKey: "hotspotSSID") ?? "" } set { d.set(newValue, forKey: "hotspotSSID") } }
     var proxyHost: String { get { d.string(forKey: "proxyHost") ?? "" } set { d.set(newValue, forKey: "proxyHost") } }
     var proxyPort: String { get { d.string(forKey: "proxyPort") ?? "7890" } set { d.set(newValue, forKey: "proxyPort") } }
     var serviceName: String { get { d.string(forKey: "serviceName") ?? "Wi-Fi" } set { d.set(newValue, forKey: "serviceName") } }
     var iconName: String { get { d.string(forKey: "iconName") ?? "key.fill" } set { d.set(newValue, forKey: "iconName") } }
-    var waitSeconds: Int { get { d.object(forKey: "waitSeconds") as? Int ?? 9 } set { d.set(newValue, forKey: "waitSeconds") } }
-    var autoReleaseOnSwitch: Bool { get { d.object(forKey: "autoReleaseOnSwitch") as? Bool ?? true } set { d.set(newValue, forKey: "autoReleaseOnSwitch") } }
     var syncPAC: Bool { get { d.object(forKey: "syncPAC") as? Bool ?? true } set { d.set(newValue, forKey: "syncPAC") } }
     var alsoSOCKS: Bool { get { d.object(forKey: "alsoSOCKS") as? Bool ?? false } set { d.set(newValue, forKey: "alsoSOCKS") } }
     var socksPort: String { get { d.string(forKey: "socksPort") ?? "7891" } set { d.set(newValue, forKey: "socksPort") } }
     var hotspotPrefix: String { get { d.string(forKey: "hotspotPrefix") ?? "" } set { d.set(newValue, forKey: "hotspotPrefix") } }
-    var autoMode: Bool { get { d.object(forKey: "autoMode") as? Bool ?? true } set { d.set(newValue, forKey: "autoMode") } }
 
-    var isConfigured: Bool {
+    var autoMode: Bool {
+        get { d.object(forKey: "autoMode") as? Bool ?? true }
+        set {
+            d.set(newValue, forKey: "autoMode")
+            if newValue { d.set(false, forKey: "clashAutoMode") }
+        }
+    }
+
+    // MARK: 本机 Clash Verge 控制（仅指定网段开启）
+    var clashAutoMode: Bool {
+        get { d.object(forKey: "clashAutoMode") as? Bool ?? false }
+        set {
+            d.set(newValue, forKey: "clashAutoMode")
+            if newValue { d.set(false, forKey: "autoMode") }
+        }
+    }
+
+    var autoStrategy: AutoStrategy {
+        get {
+            if autoMode { return .phoneProxy }
+            if clashAutoMode { return .localClash }
+            return .none
+        }
+        set {
+            switch newValue {
+            case .none:
+                d.set(false, forKey: "autoMode")
+                d.set(false, forKey: "clashAutoMode")
+            case .phoneProxy:
+                d.set(true, forKey: "autoMode")
+                d.set(false, forKey: "clashAutoMode")
+            case .localClash:
+                d.set(false, forKey: "autoMode")
+                d.set(true, forKey: "clashAutoMode")
+            }
+        }
+    }
+
+    var clashWifiPrefixes: String { get { d.string(forKey: "clashWifiPrefixes") ?? "" } set { d.set(newValue, forKey: "clashWifiPrefixes") } }
+    var clashControlTUN: Bool { get { d.object(forKey: "clashControlTUN") as? Bool ?? true } set { d.set(newValue, forKey: "clashControlTUN") } }
+    var clashControlMode: Bool { get { d.object(forKey: "clashControlMode") as? Bool ?? true } set { d.set(newValue, forKey: "clashControlMode") } }
+    var clashControlSysProxy: Bool { get { d.object(forKey: "clashControlSysProxy") as? Bool ?? false } set { d.set(newValue, forKey: "clashControlSysProxy") } }
+    var clashSysProxyPort: String { get { d.string(forKey: "clashSysProxyPort") ?? "7897" } set { d.set(newValue, forKey: "clashSysProxyPort") } }
+    var clashSocketPath: String {
+        get {
+            let saved = d.string(forKey: "clashSocketPath")?.trimmingCharacters(in: .whitespaces) ?? ""
+            return saved.isEmpty ? Self.defaultClashSocketPath : saved
+        }
+        set { d.set(newValue, forKey: "clashSocketPath") }
+    }
+
+    static var defaultClashSocketPath: String {
+        "/var/run/clash-verge-service/users/\(getuid())/verge-mihomo.sock"
+    }
+
+    var isProxyConfigured: Bool {
         !proxyHost.trimmingCharacters(in: .whitespaces).isEmpty &&
-        !hotspotPrefix.trimmingCharacters(in: .whitespaces).isEmpty
+        !Self.parsePrefixes(hotspotPrefix).isEmpty
+    }
+
+    var isClashConfigured: Bool {
+        !Self.parsePrefixes(clashWifiPrefixes).isEmpty
+    }
+
+    static func parsePrefixes(_ raw: String) -> [String] {
+        raw.split(whereSeparator: { $0 == "," || $0 == "，" || $0 == "\n" })
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
+
+    static func ipMatchesPrefixes(_ ip: String, _ rawPrefixes: String) -> Bool {
+        guard !ip.isEmpty, ip != "未连接" else { return false }
+        return parsePrefixes(rawPrefixes).contains { ip.hasPrefix($0) }
     }
 
     static func isValidPort(_ raw: String) -> Bool {
@@ -31,33 +108,62 @@ final class Config {
     }
 }
 
-// MARK: - 网络状态快照
+// MARK: - 网络与 Clash 状态快照
+
+private struct ClashStatus {
+    var available: Bool = false
+    var tunEnabled: Bool = false
+    var mode: String = "rule"
+}
 
 private struct NetworkSnapshot {
     var ip: String = "检测中…"
     var proxyEnabled: Bool = false
-    var savedNetworks: [String] = []
+    var proxyServer: String = ""
+    var proxyPort: String = ""
     var interfaceName: String = "en0"
+    var clash: ClashStatus = ClashStatus()
+
+    var isLocalClashProxyActive: Bool {
+        proxyEnabled && (proxyServer == "127.0.0.1" || proxyServer == "localhost")
+    }
+
+    var isPhoneProxyActive: Bool {
+        proxyEnabled && !isLocalClashProxyActive
+    }
 }
 
 // MARK: - 设置窗口
 
 final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let config = Config.shared
-    private var onSave: () -> Void
+    private var onSave: (_ strategyChanged: Bool) -> Void
 
+    // 互斥自动模式单选框
+    private var autoNoneRadio: NSButton!
+    private var autoPhoneRadio: NSButton!
+    private var autoClashRadio: NSButton!
+
+    // 手机代理控件
     private var ssidField: NSTextField!
     private var hostField: NSTextField!
     private var portField: NSTextField!
     private var serviceField: NSTextField!
-    private var iconPopup: NSPopUpButton!
-    private var waitField: NSTextField!
     private var prefixField: NSTextField!
     private var socksPortField: NSTextField!
-    private var autoReleaseCheck: NSButton!
     private var syncPACCheck: NSButton!
     private var socksCheck: NSButton!
-    private var autoModeCheck: NSButton!
+
+    // Clash 控件
+    private var clashPrefixesField: NSTextField!
+    private var clashSocketField: NSTextField!
+    private var clashSysProxyPortField: NSTextField!
+    private var clashTUNCheck: NSButton!
+    private var clashModeCheck: NSButton!
+    private var clashSysProxyCheck: NSButton!
+
+    // 通用控件
+    private var iconPopup: NSPopUpButton!
 
     private let iconChoices: [(String, String)] = [
         ("key.fill", "钥匙"), ("wifi", "Wi-Fi"), ("lock.fill", "锁"),
@@ -65,9 +171,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         ("antenna.radiowaves.left.and.right", "信号"), ("bolt.fill", "闪电")
     ]
 
-    init(onSave: @escaping () -> Void) {
+    init(onSave: @escaping (_ strategyChanged: Bool) -> Void) {
         self.onSave = onSave
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 560),
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 550, height: 700),
                          styleMask: [.titled, .closable], backing: .buffered, defer: false)
         w.title = "ProxySwitch 设置"
         w.center()
@@ -84,12 +190,18 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let label = NSTextField(labelWithString: title)
         label.alignment = .right
         label.setContentHuggingPriority(.defaultHigh, for: .horizontal)
-        label.widthAnchor.constraint(equalToConstant: 150).isActive = true
+        label.widthAnchor.constraint(equalToConstant: 155).isActive = true
         let h = NSStackView(views: [label, control])
         h.orientation = .horizontal
         h.spacing = 10
         h.alignment = .centerY
         return h
+    }
+
+    private func sectionTitle(_ text: String) -> NSView {
+        let l = NSTextField(labelWithString: text)
+        l.font = NSFont.boldSystemFont(ofSize: 13)
+        return l
     }
 
     private func hint(_ text: String) -> NSView {
@@ -99,24 +211,47 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         return l
     }
 
+    private func separator() -> NSView {
+        let box = NSBox()
+        box.boxType = .separator
+        box.widthAnchor.constraint(equalToConstant: 490).isActive = true
+        return box
+    }
+
+    @objc private func autoRadioChanged(_ sender: NSButton) {
+        for btn in [autoNoneRadio!, autoPhoneRadio!, autoClashRadio!] {
+            btn.state = (btn === sender) ? .on : .off
+        }
+    }
+
     private func buildUI() {
+        autoNoneRadio = NSButton(radioButtonWithTitle: "关闭自动（仅通过菜单手动切换）", target: self, action: #selector(autoRadioChanged(_:)))
+        autoPhoneRadio = NSButton(radioButtonWithTitle: "自动：手机代理（连上手机热点，转发流量到手机 Clash）", target: self, action: #selector(autoRadioChanged(_:)))
+        autoClashRadio = NSButton(radioButtonWithTitle: "自动：本机 Clash（仅连上指定 Wi-Fi 时开启，离开关闭）", target: self, action: #selector(autoRadioChanged(_:)))
+
         ssidField = NSTextField(string: "")
         ssidField.placeholderString = "可选，仅用于菜单展示"
         hostField = NSTextField(string: "")
-        hostField.placeholderString = "例：172.20.10.1"
+        hostField.placeholderString = "手机热点网关 IP，例：10.23.216.132"
         portField = NSTextField(string: "")
         portField.placeholderString = "1–65535（默认 7890）"
         serviceField = NSTextField(string: "")
         serviceField.placeholderString = "默认 Wi-Fi"
-        waitField = NSTextField(string: "")
-        waitField.placeholderString = "3–60"
         prefixField = NSTextField(string: "")
-        prefixField.placeholderString = "例：172.20.10."
+        prefixField.placeholderString = "例：10.23.216.（多个用逗号分隔）"
         socksPortField = NSTextField(string: "")
         socksPortField.placeholderString = "1–65535（默认 7891）"
 
-        for f in [ssidField, hostField, portField, serviceField, waitField, prefixField, socksPortField] {
-            f!.widthAnchor.constraint(equalToConstant: 210).isActive = true
+        clashPrefixesField = NSTextField(string: "")
+        clashPrefixesField.placeholderString = "例：192.168.1., 192.168.31."
+        clashSocketField = NSTextField(string: "")
+        clashSocketField.placeholderString = Config.defaultClashSocketPath
+        clashSysProxyPortField = NSTextField(string: "")
+        clashSysProxyPortField.placeholderString = "默认 7897"
+
+        for f in [ssidField, hostField, portField, serviceField, prefixField, socksPortField,
+                  clashPrefixesField, clashSocketField, clashSysProxyPortField] {
+            f!.widthAnchor.constraint(equalToConstant: 265).isActive = true
         }
 
         iconPopup = NSPopUpButton(frame: .zero, pullsDown: false)
@@ -125,10 +260,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             iconPopup.lastItem?.representedObject = symbol
         }
 
-        autoModeCheck = NSButton(checkboxWithTitle: "自动检测：连上热点就开代理，离开就关", target: nil, action: nil)
-        autoReleaseCheck = NSButton(checkboxWithTitle: "切换到别的 Wi-Fi 时自动释放代理", target: nil, action: nil)
-        syncPACCheck = NSButton(checkboxWithTitle: "设置代理时关闭「自动配置代理」(PAC)", target: nil, action: nil)
-        socksCheck = NSButton(checkboxWithTitle: "同时设置 SOCKS 代理", target: nil, action: nil)
+        syncPACCheck = NSButton(checkboxWithTitle: "开启代理时关闭「自动配置代理」(PAC)", target: nil, action: nil)
+        socksCheck = NSButton(checkboxWithTitle: "同时设置手机代理的 SOCKS 端口", target: nil, action: nil)
+
+        clashTUNCheck = NSButton(checkboxWithTitle: "控制 TUN 模式（连上开启 / 离开关闭）", target: nil, action: nil)
+        clashModeCheck = NSButton(checkboxWithTitle: "控制出站模式（连上 rule / 离开 direct）", target: nil, action: nil)
+        clashSysProxyCheck = NSButton(checkboxWithTitle: "同时控制本机 Clash 系统代理（127.0.0.1:端口）", target: nil, action: nil)
 
         let save = NSButton(title: "保存", target: self, action: #selector(saveClicked))
         save.keyEquivalent = "\r"
@@ -140,53 +277,78 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         buttons.spacing = 10
 
         let stack = NSStackView(views: [
-            row("热点名称（展示用）", ssidField),
-            row("代理服务器", hostField),
+            sectionTitle("一、自动模式（两者互斥，只能启用一种）"),
+            autoNoneRadio,
+            autoPhoneRadio,
+            autoClashRadio,
+
+            separator(),
+            sectionTitle("二、手机代理（手机开 Clash 并允许局域网连接，将流量转过去）"),
+            row("手机热点网段前缀", prefixField),
+            hint("  用本机 IP 前缀判断，支持逗号分隔多个（例：10.23.216.）"),
+            row("手机代理 IP", hostField),
             row("HTTP/HTTPS 端口", portField),
-            row("热点网段前缀", prefixField),
-            hint("  用本机 IP 前缀判断是否已连上热点（例：172.20.10.）"),
-            row("网络服务名", serviceField),
-            hint("  系统设置 → 网络 里对应服务的名称，一般是 Wi-Fi"),
-            row("切网后等待秒数", waitField),
-            row("菜单栏图标", iconPopup),
             row("SOCKS 端口", socksPortField),
-            autoModeCheck,
-            autoReleaseCheck,
+            row("热点名称（展示用）", ssidField),
             syncPACCheck,
             socksCheck,
+
+            separator(),
+            sectionTitle("三、本机 Clash Verge 控制（仅连上指定网段开启）"),
+            row("Clash 启用网段前缀", clashPrefixesField),
+            hint("  只有连上这些网段才开启本机 Clash；校园网等其他网络自动关闭"),
+            row("本机 Clash 端口", clashSysProxyPortField),
+            row("Clash Socket 路径", clashSocketField),
+            clashTUNCheck,
+            clashModeCheck,
+            clashSysProxyCheck,
+
+            separator(),
+            row("网络服务名", serviceField),
+            row("菜单栏图标", iconPopup),
             buttons
         ])
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 12
+        stack.spacing = 8
         stack.translatesAutoresizingMaskIntoConstraints = false
 
         let content = NSView()
         content.addSubview(stack)
         NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 20),
+            stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 18),
             stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
             stack.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor, constant: -20),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: content.bottomAnchor, constant: -20)
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: content.bottomAnchor, constant: -18)
         ])
         window?.contentView = content
 
         let fit = stack.fittingSize
-        window?.setContentSize(NSSize(width: max(520, fit.width + 42), height: max(300, fit.height + 42)))
+        window?.setContentSize(NSSize(width: max(550, fit.width + 42), height: max(420, fit.height + 36)))
     }
 
     private func loadValues() {
+        let strategy = config.autoStrategy
+        autoNoneRadio.state = (strategy == .none) ? .on : .off
+        autoPhoneRadio.state = (strategy == .phoneProxy) ? .on : .off
+        autoClashRadio.state = (strategy == .localClash) ? .on : .off
+
         ssidField.stringValue = config.hotspotSSID
         hostField.stringValue = config.proxyHost
         portField.stringValue = config.proxyPort
         serviceField.stringValue = config.serviceName
         prefixField.stringValue = config.hotspotPrefix
-        waitField.stringValue = String(config.waitSeconds)
         socksPortField.stringValue = config.socksPort
-        autoModeCheck.state = config.autoMode ? .on : .off
-        autoReleaseCheck.state = config.autoReleaseOnSwitch ? .on : .off
         syncPACCheck.state = config.syncPAC ? .on : .off
         socksCheck.state = config.alsoSOCKS ? .on : .off
+
+        clashPrefixesField.stringValue = config.clashWifiPrefixes
+        clashSocketField.stringValue = config.clashSocketPath
+        clashSysProxyPortField.stringValue = config.clashSysProxyPort
+        clashTUNCheck.state = config.clashControlTUN ? .on : .off
+        clashModeCheck.state = config.clashControlMode ? .on : .off
+        clashSysProxyCheck.state = config.clashControlSysProxy ? .on : .off
+
         if let idx = iconChoices.firstIndex(where: { $0.0 == config.iconName }) {
             iconPopup.selectItem(at: idx)
         } else {
@@ -219,34 +381,70 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     @objc private func saveClicked() {
         let port = portField.stringValue.trimmingCharacters(in: .whitespaces)
         if !Config.isValidPort(port) {
-            showValidationError("HTTP/HTTPS 端口必须是 1–65535 之间的整数。")
+            showValidationError("手机代理 HTTP/HTTPS 端口必须是 1–65535 之间的整数。")
             return
         }
         let socksPort = socksPortField.stringValue.trimmingCharacters(in: .whitespaces)
         if socksCheck.state == .on && !Config.isValidPort(socksPort) {
-            showValidationError("SOCKS 端口必须是 1–65535 之间的整数。")
+            showValidationError("手机代理 SOCKS 端口必须是 1–65535 之间的整数。")
+            return
+        }
+        let clashPort = clashSysProxyPortField.stringValue.trimmingCharacters(in: .whitespaces)
+        if clashSysProxyCheck.state == .on && !Config.isValidPort(clashPort) {
+            showValidationError("本机 Clash 端口必须是 1–65535 之间的整数。")
             return
         }
 
+        let newPrefixes = clashPrefixesField.stringValue.trimmingCharacters(in: .whitespaces)
+        if autoClashRadio.state == .on && Config.parsePrefixes(newPrefixes).isEmpty {
+            showValidationError("选择「自动：本机 Clash」时，请先填写 Clash 启用网段前缀。")
+            return
+        }
+
+        let newHost = hostField.stringValue.trimmingCharacters(in: .whitespaces)
+        let newPhonePrefix = prefixField.stringValue.trimmingCharacters(in: .whitespaces)
+        if autoPhoneRadio.state == .on && (newHost.isEmpty || Config.parsePrefixes(newPhonePrefix).isEmpty) {
+            showValidationError("选择「自动：手机代理」时，请先填写手机热点网段前缀与手机代理 IP。")
+            return
+        }
+
+        let previousStrategy = config.autoStrategy
+        let newStrategy: AutoStrategy
+        if autoPhoneRadio.state == .on {
+            newStrategy = .phoneProxy
+        } else if autoClashRadio.state == .on {
+            newStrategy = .localClash
+        } else {
+            newStrategy = .none
+        }
+        config.autoStrategy = newStrategy
+
         let service = serviceField.stringValue.trimmingCharacters(in: .whitespaces)
         config.hotspotSSID = ssidField.stringValue.trimmingCharacters(in: .whitespaces)
-        config.proxyHost = hostField.stringValue.trimmingCharacters(in: .whitespaces)
+        config.proxyHost = newHost
         config.proxyPort = port
         config.serviceName = service.isEmpty ? "Wi-Fi" : service
-        config.hotspotPrefix = prefixField.stringValue.trimmingCharacters(in: .whitespaces)
-        config.waitSeconds = min(60, max(3, Int(waitField.stringValue.trimmingCharacters(in: .whitespaces)) ?? 9))
+        config.hotspotPrefix = newPhonePrefix
         if Config.isValidPort(socksPort) {
             config.socksPort = socksPort
         }
-        if let sym = iconPopup.selectedItem?.representedObject as? String {
-            config.iconName = sym
-        }
-        config.autoMode = autoModeCheck.state == .on
-        config.autoReleaseOnSwitch = autoReleaseCheck.state == .on
         config.syncPAC = syncPACCheck.state == .on
         config.alsoSOCKS = socksCheck.state == .on
 
-        onSave()
+        config.clashWifiPrefixes = newPrefixes
+        config.clashSocketPath = clashSocketField.stringValue.trimmingCharacters(in: .whitespaces)
+        if Config.isValidPort(clashPort) {
+            config.clashSysProxyPort = clashPort
+        }
+        config.clashControlTUN = clashTUNCheck.state == .on
+        config.clashControlMode = clashModeCheck.state == .on
+        config.clashControlSysProxy = clashSysProxyCheck.state == .on
+
+        if let sym = iconPopup.selectedItem?.representedObject as? String {
+            config.iconName = sym
+        }
+
+        onSave(newStrategy != previousStrategy)
         window?.close()
     }
 
@@ -267,12 +465,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let config = Config.shared
     private let ns = "/usr/sbin/networksetup"
     private let ipconfig = "/usr/sbin/ipconfig"
+    private let curl = "/usr/bin/curl"
     private var settingsController: SettingsWindowController?
 
     // 所有可变网络状态仅在 queue 上读写；snapshot 通过主线程更新菜单
     private let queue = DispatchQueue(label: "com.dsh.proxyswitch.monitor")
     private var autoOpened = false
     private var suppressAuto = false
+    private var clashSuppressAuto = false
     private var lastIP = ""
     private var snapshot = NetworkSnapshot()
     private var monitoredInterface = ""
@@ -283,18 +483,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var isMenuOpen = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // 防止历史配置同时打开两个自动模式
+        if config.autoMode && config.clashAutoMode {
+            config.autoStrategy = .phoneProxy
+        }
+
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         applyIcon()
         menu.delegate = self
+        menu.autoenablesItems = false
         statusItem.menu = menu
         buildMenu()
 
         queue.async {
             let iface = self.resolveInterface(for: self.config.serviceName)
-            let snap = self.collectSnapshot(interface: iface)
-            if self.config.isConfigured,
-               !snap.ip.hasPrefix(self.config.hotspotPrefix),
-               self.currentProxyServer() == self.config.proxyHost {
+            let ip = self.currentIP(interface: iface)
+            let web = self.currentWebProxy()
+            if self.config.autoStrategy == .phoneProxy,
+               self.config.isProxyConfigured,
+               !Config.ipMatchesPrefixes(ip, self.config.hotspotPrefix),
+               web.server == self.config.proxyHost {
                 _ = self.proxyOff()
             }
             let updatedSnap = self.collectSnapshot(interface: iface)
@@ -309,8 +517,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuWillOpen(_ menu: NSMenu) {
         isMenuOpen = true
+        let sem = DispatchSemaphore(value: 0)
+        var freshSnap: NetworkSnapshot?
+        queue.async {
+            let iface = self.resolveInterface(for: self.config.serviceName)
+            freshSnap = self.collectSnapshot(interface: iface)
+            sem.signal()
+        }
+        if sem.wait(timeout: .now() + 0.35) == .success, let snap = freshSnap {
+            snapshot = snap
+        } else {
+            refreshSnapshotAsync()
+        }
         buildMenu()
-        refreshSnapshotAsync()
     }
 
     func menuDidClose(_ menu: NSMenu) {
@@ -372,18 +591,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return "en0"
     }
 
-    private func currentProxyServer() -> String {
-        let res = run(ns, ["-getwebproxy", config.serviceName])
-        for line in res.output.split(separator: "\n") {
-            if line.hasPrefix("Server:") {
-                return line.replacingOccurrences(of: "Server:", with: "").trimmingCharacters(in: .whitespaces)
+    private func currentWebProxy() -> (enabled: Bool, server: String, port: String) {
+        let out = run(ns, ["-getwebproxy", config.serviceName]).output
+        var enabled = false
+        var server = ""
+        var port = ""
+        for line in out.split(separator: "\n") {
+            if line.hasPrefix("Enabled:") {
+                enabled = line.contains("Yes")
+            } else if line.hasPrefix("Server:") {
+                server = line.replacingOccurrences(of: "Server:", with: "").trimmingCharacters(in: .whitespaces)
+            } else if line.hasPrefix("Port:") {
+                port = line.replacingOccurrences(of: "Port:", with: "").trimmingCharacters(in: .whitespaces)
             }
         }
-        return ""
-    }
-
-    private func proxyEnabled() -> Bool {
-        run(ns, ["-getwebproxy", config.serviceName]).output.contains("Enabled: Yes")
+        return (enabled, server, port)
     }
 
     private func currentIP(interface: String) -> String {
@@ -392,35 +614,103 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return (res.status == 0 && !out.isEmpty) ? out : "未连接"
     }
 
-    private func savedNetworks(interface: String) -> [String] {
-        run(ns, ["-listpreferredwirelessnetworks", interface]).output
-            .split(separator: "\n").dropFirst()
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
+    // MARK: Clash Verge（Mihomo Unix Socket）控制
+
+    private func queryClashStatus() -> ClashStatus {
+        let sock = config.clashSocketPath
+        guard FileManager.default.fileExists(atPath: sock) else { return ClashStatus() }
+
+        let res = run(curl, ["-s", "--max-time", "2", "--unix-socket", sock, "http://localhost/configs"], timeout: 3.0)
+        guard res.status == 0,
+              let data = res.output.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return ClashStatus()
+        }
+
+        let tunDict = json["tun"] as? [String: Any]
+        let tunEnabled = (tunDict?["enable"] as? Bool) ?? false
+        let mode = (json["mode"] as? String) ?? "rule"
+        return ClashStatus(available: true, tunEnabled: tunEnabled, mode: mode)
+    }
+
+    @discardableResult
+    private func patchClashConfig(_ payload: [String: Any]) -> Bool {
+        let sock = config.clashSocketPath
+        guard FileManager.default.fileExists(atPath: sock),
+              let data = try? JSONSerialization.data(withJSONObject: payload),
+              let body = String(data: data, encoding: .utf8) else {
+            return false
+        }
+
+        let res = run(curl, [
+            "-s", "-f", "--max-time", "2",
+            "--unix-socket", sock,
+            "-X", "PATCH",
+            "-H", "Content-Type: application/json",
+            "-d", body,
+            "http://localhost/configs"
+        ], timeout: 3.0)
+        return res.status == 0
+    }
+
+    @discardableResult
+    private func setClashActive(_ active: Bool) -> Bool {
+        var patch: [String: Any] = [:]
+        if config.clashControlTUN {
+            patch["tun"] = ["enable": active]
+        }
+        if config.clashControlMode {
+            patch["mode"] = active ? "rule" : "direct"
+        }
+
+        var ok = true
+        if !patch.isEmpty {
+            ok = patchClashConfig(patch)
+        }
+
+        if config.clashControlSysProxy {
+            if active {
+                _ = setSystemProxy(host: "127.0.0.1", port: config.clashSysProxyPort, socksPort: config.clashSysProxyPort, enableSocks: true)
+            } else {
+                let web = currentWebProxy()
+                if web.enabled && (web.server == "127.0.0.1" || web.server == "localhost") {
+                    _ = proxyOff()
+                }
+            }
+        }
+        return ok
     }
 
     private func collectSnapshot(interface: String) -> NetworkSnapshot {
-        NetworkSnapshot(
+        let web = currentWebProxy()
+        return NetworkSnapshot(
             ip: currentIP(interface: interface),
-            proxyEnabled: proxyEnabled(),
-            savedNetworks: savedNetworks(interface: interface),
-            interfaceName: interface
+            proxyEnabled: web.enabled,
+            proxyServer: web.server,
+            proxyPort: web.port,
+            interfaceName: interface,
+            clash: queryClashStatus()
         )
     }
 
     @discardableResult
-    private func proxyOn() -> Bool {
-        guard !config.proxyHost.trimmingCharacters(in: .whitespaces).isEmpty,
-              Config.isValidPort(config.proxyPort) else { return false }
+    private func setSystemProxy(host: String, port: String, socksPort: String, enableSocks: Bool) -> Bool {
+        let h = host.trimmingCharacters(in: .whitespaces)
+        guard !h.isEmpty, Config.isValidPort(port) else { return false }
         if config.syncPAC {
             _ = run(ns, ["-setautoproxystate", config.serviceName, "off"])
         }
-        let r1 = run(ns, ["-setwebproxy", config.serviceName, config.proxyHost, config.proxyPort])
-        let r2 = run(ns, ["-setsecurewebproxy", config.serviceName, config.proxyHost, config.proxyPort])
-        if config.alsoSOCKS && Config.isValidPort(config.socksPort) {
-            _ = run(ns, ["-setsocksfirewallproxy", config.serviceName, config.proxyHost, config.socksPort])
+        let r1 = run(ns, ["-setwebproxy", config.serviceName, h, port])
+        let r2 = run(ns, ["-setsecurewebproxy", config.serviceName, h, port])
+        if enableSocks && Config.isValidPort(socksPort) {
+            _ = run(ns, ["-setsocksfirewallproxy", config.serviceName, h, socksPort])
         }
         return r1.status == 0 && r2.status == 0
+    }
+
+    @discardableResult
+    private func phoneProxyOn() -> Bool {
+        setSystemProxy(host: config.proxyHost, port: config.proxyPort, socksPort: config.socksPort, enableSocks: config.alsoSOCKS)
     }
 
     @discardableResult
@@ -485,36 +775,76 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         queue.async {
             let iface = self.resolveInterface(for: self.config.serviceName)
             let ip = self.currentIP(interface: iface)
-            let match = self.config.isConfigured && ip.hasPrefix(self.config.hotspotPrefix)
-            var on = self.proxyEnabled()
+            let matchPhone = self.config.isProxyConfigured && Config.ipMatchesPrefixes(ip, self.config.hotspotPrefix)
+            let matchClash = self.config.isClashConfigured && Config.ipMatchesPrefixes(ip, self.config.clashWifiPrefixes)
+
+            var web = self.currentWebProxy()
             let ipChanged = (ip != self.lastIP)
             if ipChanged {
                 self.lastIP = ip
                 self.suppressAuto = false
+                self.clashSuppressAuto = false
             }
 
-            if self.config.autoMode && self.config.isConfigured && !self.suppressAuto {
-                if match {
-                    if !on {
-                        if self.proxyOn() {
-                            on = true
+            let strategy = self.config.autoStrategy
+            var clash = self.queryClashStatus()
+
+            switch strategy {
+            case .none:
+                break
+
+            case .phoneProxy:
+                if self.config.isProxyConfigured && !self.suppressAuto {
+                    if matchPhone {
+                        if !web.enabled || web.server != self.config.proxyHost || web.port != self.config.proxyPort {
+                            _ = self.phoneProxyOn()
+                            web = self.currentWebProxy()
+                        }
+                        self.autoOpened = true
+                    } else if web.enabled && self.autoOpened {
+                        _ = self.proxyOff()
+                        web = self.currentWebProxy()
+                        self.autoOpened = false
+                    } else if !web.enabled {
+                        self.autoOpened = false
+                    }
+                }
+
+            case .localClash:
+                if self.config.isClashConfigured && clash.available && !self.clashSuppressAuto {
+                    if matchClash {
+                        let needTUN = self.config.clashControlTUN && !clash.tunEnabled
+                        let needMode = self.config.clashControlMode && clash.mode != "rule"
+                        let needSys = self.config.clashControlSysProxy &&
+                            (!web.enabled || (web.server != "127.0.0.1" && web.server != "localhost") || web.port != self.config.clashSysProxyPort)
+
+                        if needTUN || needMode || needSys {
+                            _ = self.setClashActive(true)
+                            clash = self.queryClashStatus()
+                            web = self.currentWebProxy()
+                        }
+                    } else {
+                        let needCloseTUN = self.config.clashControlTUN && clash.tunEnabled
+                        let needDirect = self.config.clashControlMode && clash.mode != "direct"
+                        let needCloseSys = self.config.clashControlSysProxy &&
+                            web.enabled && (web.server == "127.0.0.1" || web.server == "localhost")
+
+                        if needCloseTUN || needDirect || needCloseSys {
+                            _ = self.setClashActive(false)
+                            clash = self.queryClashStatus()
+                            web = self.currentWebProxy()
                         }
                     }
-                    self.autoOpened = true
-                } else if on && self.autoOpened {
-                    _ = self.proxyOff()
-                    on = false
-                    self.autoOpened = false
-                } else if !on {
-                    self.autoOpened = false
                 }
             }
 
             let snap = NetworkSnapshot(
                 ip: ip,
-                proxyEnabled: on,
-                savedNetworks: self.savedNetworks(interface: iface),
-                interfaceName: iface
+                proxyEnabled: web.enabled,
+                proxyServer: web.server,
+                proxyPort: web.port,
+                interfaceName: iface,
+                clash: clash
             )
             DispatchQueue.main.async {
                 self.snapshot = snap
@@ -524,63 +854,136 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    private func modeLabel(_ mode: String) -> String {
+        switch mode {
+        case "rule": return "规则 (rule)"
+        case "direct": return "直连 (direct)"
+        case "global": return "全局 (global)"
+        default: return mode
+        }
+    }
+
+    private func disabledHeader(_ title: String) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        item.isEnabled = false
+        return item
+    }
+
     private func buildMenu() {
         menu.removeAllItems()
 
         let ip = snapshot.ip
-        let onProxy = snapshot.proxyEnabled
-        let match = config.isConfigured && ip.hasPrefix(config.hotspotPrefix)
+        let matchPhone = config.isProxyConfigured && Config.ipMatchesPrefixes(ip, config.hotspotPrefix)
+        let matchClash = config.isClashConfigured && Config.ipMatchesPrefixes(ip, config.clashWifiPrefixes)
 
-        let statusTitle: String
-        if !config.isConfigured {
-            statusTitle = "尚未配置代理与网段前缀（请点下方「设置…」）"
+        // 1. 顶部实时状态
+        let netTag = matchPhone ? "✓ 手机热点网段" : (matchClash ? "✓ Clash 指定网段" : "其他网络")
+        menu.addItem(disabledHeader("IP（\(snapshot.interfaceName)）：\(ip)   \(netTag)"))
+
+        if snapshot.isPhoneProxyActive {
+            menu.addItem(disabledHeader("手机代理：开（\(snapshot.proxyServer):\(snapshot.proxyPort)）"))
         } else {
-            statusTitle = "代理：\(onProxy ? "开" : "关")    IP（\(snapshot.interfaceName)）：\(ip)   \(match ? "✓ 热点" : "非热点")"
+            menu.addItem(disabledHeader("手机代理：关"))
         }
-        let status = NSMenuItem(title: statusTitle, action: nil, keyEquivalent: "")
-        status.isEnabled = false
-        menu.addItem(status)
 
-        if config.isConfigured {
-            let targetLabel = config.hotspotSSID.isEmpty ? "\(config.hotspotPrefix)*" : config.hotspotSSID
-            let summary = NSMenuItem(title: "\(config.proxyHost):\(config.proxyPort) → \(targetLabel)", action: nil, keyEquivalent: "")
-            summary.isEnabled = false
-            menu.addItem(summary)
+        if snapshot.clash.available {
+            let localSys = snapshot.isLocalClashProxyActive ? "开" : "关"
+            menu.addItem(disabledHeader("本机 Clash：TUN \(snapshot.clash.tunEnabled ? "开" : "关") · 本地代理 \(localSys) · \(modeLabel(snapshot.clash.mode))"))
+        } else {
+            menu.addItem(disabledHeader("本机 Clash：未运行或 Socket 不可达"))
         }
-        menu.addItem(.separator())
-
-        let auto = NSMenuItem(title: "自动检测：\(config.autoMode ? "开" : "关")", action: #selector(toggleAuto), keyEquivalent: "")
-        auto.target = self
-        auto.state = config.autoMode ? .on : .off
-        menu.addItem(auto)
-
-        let onItem = NSMenuItem(title: "手动开代理", action: #selector(manualProxyOn), keyEquivalent: "")
-        onItem.target = self
-        onItem.isEnabled = !config.proxyHost.trimmingCharacters(in: .whitespaces).isEmpty
-        menu.addItem(onItem)
-
-        let offItem = NSMenuItem(title: "手动关代理", action: #selector(manualProxyOff), keyEquivalent: "")
-        offItem.target = self
-        menu.addItem(offItem)
 
         menu.addItem(.separator())
 
-        let wifiItem = NSMenuItem(title: "切换 Wi-Fi", action: nil, keyEquivalent: "")
-        let wifiMenu = NSMenu()
-        for name in snapshot.savedNetworks {
-            let item = NSMenuItem(title: name, action: #selector(joinNetwork(_:)), keyEquivalent: "")
+        // 2. 自动模式（互斥单选）
+        menu.addItem(disabledHeader("自动模式（互斥）"))
+        let strategy = config.autoStrategy
+
+        let autoOffItem = NSMenuItem(title: "关闭自动（仅手动）", action: #selector(selectAutoNone), keyEquivalent: "")
+        autoOffItem.target = self
+        autoOffItem.state = (strategy == .none) ? .on : .off
+        menu.addItem(autoOffItem)
+
+        let autoPhoneTitle = config.isProxyConfigured
+            ? "自动：手机代理（连热点转手机 Clash）"
+            : "自动：手机代理（需先配置热点 IP）"
+        let autoPhoneItem = NSMenuItem(title: autoPhoneTitle, action: #selector(selectAutoPhone), keyEquivalent: "")
+        autoPhoneItem.target = self
+        autoPhoneItem.state = (strategy == .phoneProxy) ? .on : .off
+        autoPhoneItem.isEnabled = config.isProxyConfigured
+        menu.addItem(autoPhoneItem)
+
+        let autoClashTitle = config.isClashConfigured
+            ? "自动：本机 Clash（仅连指定 Wi-Fi 开启）"
+            : "自动：本机 Clash（需先配置启用网段）"
+        let autoClashItem = NSMenuItem(title: autoClashTitle, action: #selector(selectAutoClash), keyEquivalent: "")
+        autoClashItem.target = self
+        autoClashItem.state = (strategy == .localClash) ? .on : .off
+        autoClashItem.isEnabled = config.isClashConfigured
+        menu.addItem(autoClashItem)
+
+        menu.addItem(.separator())
+
+        // 3. 手机代理（热点转发）手动操作
+        let phoneTarget = config.proxyHost.isEmpty ? "未配置" : "\(config.proxyHost):\(config.proxyPort)"
+        menu.addItem(disabledHeader("手机代理（热点转发 → \(phoneTarget)）"))
+
+        let phoneOnItem = NSMenuItem(title: "开启手机代理", action: #selector(manualPhoneProxyOn), keyEquivalent: "")
+        phoneOnItem.target = self
+        phoneOnItem.state = snapshot.isPhoneProxyActive ? .on : .off
+        phoneOnItem.isEnabled = !config.proxyHost.trimmingCharacters(in: .whitespaces).isEmpty
+        menu.addItem(phoneOnItem)
+
+        let phoneOffItem = NSMenuItem(title: "关闭手机代理", action: #selector(manualPhoneProxyOff), keyEquivalent: "")
+        phoneOffItem.target = self
+        menu.addItem(phoneOffItem)
+
+        menu.addItem(.separator())
+
+        // 4. 本机 Clash Verge 控制（增加多项快捷操作）
+        menu.addItem(disabledHeader("本机 Clash 控制"))
+
+        let clashOnItem = NSMenuItem(title: "一键开启本机 Clash（TUN + 规则）", action: #selector(manualClashOn), keyEquivalent: "")
+        clashOnItem.target = self
+        clashOnItem.isEnabled = snapshot.clash.available
+        menu.addItem(clashOnItem)
+
+        let clashOffItem = NSMenuItem(title: "一键关闭本机 Clash（关 TUN + 直连）", action: #selector(manualClashOff), keyEquivalent: "")
+        clashOffItem.target = self
+        clashOffItem.isEnabled = snapshot.clash.available
+        menu.addItem(clashOffItem)
+
+        let tunItem = NSMenuItem(title: "TUN 模式", action: #selector(toggleClashTUN), keyEquivalent: "")
+        tunItem.target = self
+        tunItem.state = snapshot.clash.tunEnabled ? .on : .off
+        tunItem.isEnabled = snapshot.clash.available
+        menu.addItem(tunItem)
+
+        let localSysProxyItem = NSMenuItem(title: "本地系统代理（127.0.0.1:\(config.clashSysProxyPort)）", action: #selector(toggleLocalClashSysProxy), keyEquivalent: "")
+        localSysProxyItem.target = self
+        localSysProxyItem.state = snapshot.isLocalClashProxyActive ? .on : .off
+        menu.addItem(localSysProxyItem)
+
+        let modeMenuItem = NSMenuItem(title: "出站模式", action: nil, keyEquivalent: "")
+        let modeSubmenu = NSMenu()
+        for (val, label) in [("rule", "规则 (rule)"), ("direct", "直连 (direct)"), ("global", "全局 (global)")] {
+            let item = NSMenuItem(title: label, action: #selector(selectClashMode(_:)), keyEquivalent: "")
             item.target = self
-            item.representedObject = name
-            wifiMenu.addItem(item)
+            item.representedObject = val
+            item.state = (snapshot.clash.available && snapshot.clash.mode == val) ? .on : .off
+            item.isEnabled = snapshot.clash.available
+            modeSubmenu.addItem(item)
         }
-        wifiMenu.addItem(.separator())
-        let openWifi = NSMenuItem(title: "打开 Wi-Fi 设置…", action: #selector(openWiFiSettings), keyEquivalent: "")
-        openWifi.target = self
-        wifiMenu.addItem(openWifi)
-        wifiItem.submenu = wifiMenu
-        menu.addItem(wifiItem)
+        modeMenuItem.submenu = modeSubmenu
+        modeMenuItem.isEnabled = snapshot.clash.available
+        menu.addItem(modeMenuItem)
+
+        let openClashItem = NSMenuItem(title: "打开 Clash Verge…", action: #selector(openClashVergeApp), keyEquivalent: "")
+        openClashItem.target = self
+        menu.addItem(openClashItem)
 
         menu.addItem(.separator())
+
         let settings = NSMenuItem(title: "设置…", action: #selector(openSettings), keyEquivalent: ",")
         settings.target = self
         menu.addItem(settings)
@@ -598,12 +1001,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         a.runModal()
     }
 
-    @objc private func toggleAuto() {
-        config.autoMode.toggle()
+    // MARK: Actions
+
+    private func deactivateUnselected(for strategy: AutoStrategy) {
+        switch strategy {
+        case .phoneProxy:
+            // 切到自动手机代理：关闭未选中的本机 Clash（关 TUN + 切直连 + 清掉 127.0.0.1 本地系统代理）
+            _ = patchClashConfig(["tun": ["enable": false], "mode": "direct"])
+            let web = currentWebProxy()
+            if web.enabled && (web.server == "127.0.0.1" || web.server == "localhost") {
+                _ = proxyOff()
+            }
+        case .localClash:
+            // 切到自动本机 Clash：关掉未选中的手机代理（非 127.0.0.1 的系统代理）
+            let web = currentWebProxy()
+            if web.enabled && web.server != "127.0.0.1" && web.server != "localhost" {
+                _ = proxyOff()
+            }
+        case .none:
+            break
+        }
+    }
+
+    private func applyStrategy(_ strategy: AutoStrategy) {
+        config.autoStrategy = strategy
         queue.async {
             self.autoOpened = false
             self.suppressAuto = false
+            self.clashSuppressAuto = false
+            self.deactivateUnselected(for: strategy)
+            let snap = self.collectSnapshot(interface: self.resolveInterface(for: self.config.serviceName))
             DispatchQueue.main.async {
+                self.snapshot = snap
                 self.buildMenu()
                 self.settingsController?.refreshFromConfig()
                 self.scheduleCheck(0.2)
@@ -611,9 +1040,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    @objc private func manualProxyOn() {
+    @objc private func selectAutoNone() { applyStrategy(.none) }
+    @objc private func selectAutoPhone() { applyStrategy(.phoneProxy) }
+    @objc private func selectAutoClash() { applyStrategy(.localClash) }
+
+    @objc private func manualPhoneProxyOn() {
         queue.async {
-            let ok = self.proxyOn()
+            let ok = self.phoneProxyOn()
             self.autoOpened = false
             self.suppressAuto = false
             let snap = self.collectSnapshot(interface: self.resolveInterface(for: self.config.serviceName))
@@ -622,13 +1055,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.buildMenu()
                 self.settingsController?.refreshFromConfig()
                 if !ok {
-                    self.showAlert("开启代理失败", "请检查「设置…」中的代理服务器和端口是否正确。")
+                    self.showAlert("开启手机代理失败", "请检查「设置…」中的手机代理 IP 和端口是否正确。")
                 }
             }
         }
     }
 
-    @objc private func manualProxyOff() {
+    @objc private func manualPhoneProxyOff() {
         queue.async {
             _ = self.proxyOff()
             self.autoOpened = false
@@ -642,40 +1075,103 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    @objc private func joinNetwork(_ sender: NSMenuItem) {
-        guard let ssid = sender.representedObject as? String else { return }
-        let waitSec = config.waitSeconds
+    @objc private func manualClashOn() {
         queue.async {
-            let iface = self.resolveInterface(for: self.config.serviceName)
-            if self.config.autoReleaseOnSwitch { _ = self.proxyOff() }
-            let res = self.run(self.ns, ["-setairportnetwork", iface, ssid], timeout: 10.0)
-            let failed = res.status != 0 || res.output.contains("Failed") || res.output.lowercased().contains("error")
-            let snap = self.collectSnapshot(interface: iface)
+            _ = self.setClashActive(true)
+            self.clashSuppressAuto = true
+            let snap = self.collectSnapshot(interface: self.resolveInterface(for: self.config.serviceName))
             DispatchQueue.main.async {
                 self.snapshot = snap
                 self.buildMenu()
-                if failed {
-                    self.showAlert("自动切换失败", "系统不允许脚本直接切换 Wi-Fi。\n请点菜单栏的 Wi-Fi 图标手动选择「\(ssid)」，连上后会自动开代理。")
-                } else {
-                    // 非阻塞等待切网后复检，避免阻塞后台队列
-                    self.scheduleCheck(TimeInterval(waitSec))
-                }
             }
         }
     }
 
-    @objc private func openWiFiSettings() {
-        if let url = URL(string: "x-apple.systempreferences:com.apple.wifi-settings-extension") {
-            NSWorkspace.shared.open(url)
+    @objc private func manualClashOff() {
+        queue.async {
+            _ = self.setClashActive(false)
+            self.clashSuppressAuto = true
+            let snap = self.collectSnapshot(interface: self.resolveInterface(for: self.config.serviceName))
+            DispatchQueue.main.async {
+                self.snapshot = snap
+                self.buildMenu()
+            }
+        }
+    }
+
+    @objc private func toggleClashTUN() {
+        queue.async {
+            let cur = self.queryClashStatus()
+            guard cur.available else { return }
+            _ = self.patchClashConfig(["tun": ["enable": !cur.tunEnabled]])
+            self.clashSuppressAuto = true
+            let snap = self.collectSnapshot(interface: self.resolveInterface(for: self.config.serviceName))
+            DispatchQueue.main.async {
+                self.snapshot = snap
+                self.buildMenu()
+            }
+        }
+    }
+
+    @objc private func toggleLocalClashSysProxy() {
+        queue.async {
+            let web = self.currentWebProxy()
+            let isLocal = web.enabled && (web.server == "127.0.0.1" || web.server == "localhost")
+            if isLocal {
+                _ = self.proxyOff()
+            } else {
+                _ = self.setSystemProxy(host: "127.0.0.1", port: self.config.clashSysProxyPort, socksPort: self.config.clashSysProxyPort, enableSocks: true)
+            }
+            self.clashSuppressAuto = true
+            let snap = self.collectSnapshot(interface: self.resolveInterface(for: self.config.serviceName))
+            DispatchQueue.main.async {
+                self.snapshot = snap
+                self.buildMenu()
+            }
+        }
+    }
+
+    @objc private func selectClashMode(_ sender: NSMenuItem) {
+        guard let mode = sender.representedObject as? String else { return }
+        queue.async {
+            _ = self.patchClashConfig(["mode": mode])
+            self.clashSuppressAuto = true
+            let snap = self.collectSnapshot(interface: self.resolveInterface(for: self.config.serviceName))
+            DispatchQueue.main.async {
+                self.snapshot = snap
+                self.buildMenu()
+            }
+        }
+    }
+
+    @objc private func openClashVergeApp() {
+        let appURL = URL(fileURLWithPath: "/Applications/Clash Verge.app")
+        if FileManager.default.fileExists(atPath: appURL.path) {
+            NSWorkspace.shared.openApplication(at: appURL, configuration: NSWorkspace.OpenConfiguration())
+        } else {
+            showAlert("未找到 Clash Verge", "未在 /Applications/Clash Verge.app 找到 Clash Verge 客户端。")
         }
     }
 
     @objc private func openSettings() {
         if settingsController == nil {
-            settingsController = SettingsWindowController { [weak self] in
-                self?.applyIcon()
-                self?.buildMenu()
-                self?.scheduleCheck(0.2)
+            settingsController = SettingsWindowController { [weak self] strategyChanged in
+                guard let self = self else { return }
+                self.applyIcon()
+                self.queue.async {
+                    self.autoOpened = false
+                    self.suppressAuto = false
+                    self.clashSuppressAuto = false
+                    if strategyChanged {
+                        self.deactivateUnselected(for: self.config.autoStrategy)
+                    }
+                    let snap = self.collectSnapshot(interface: self.resolveInterface(for: self.config.serviceName))
+                    DispatchQueue.main.async {
+                        self.snapshot = snap
+                        self.buildMenu()
+                        self.scheduleCheck(0.2)
+                    }
+                }
             }
         }
         NSApp.setActivationPolicy(.regular)
